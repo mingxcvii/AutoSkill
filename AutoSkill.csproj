@@ -13,4 +13,10 @@
     <PackageReference Include="ClickableTransparentOverlay" Version="9.1.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Update="icon.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>

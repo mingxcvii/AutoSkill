@@ -24,6 +24,19 @@ namespace AutoSkill
         public DateTime LastUsed = DateTime.MinValue;
     }
 
+    public class PresetConfig
+    {
+        public string Name { get; set; } = "Default";
+        public string ToggleKeyStr { get; set; } = "HOME";
+        public string SwitchWindowKeyStr { get; set; } = "";
+        public string TargetWindowName { get; set; } = "";
+        
+        [JsonIgnore]
+        public bool IsMacroRunning { get; set; } = false;
+
+        public List<Skill> Skills { get; set; } = new List<Skill>();
+    }
+
     public class Renderer : Overlay
     {
         [DllImport("user32.dll")]
@@ -32,22 +45,48 @@ namespace AutoSkill
         private const int SM_CXSCREEN = 0;
         private const int SM_CYSCREEN = 1;
 
-        public volatile bool MacroRunning = false;
-        public List<Skill> Skills = new List<Skill>();
-        public string ToggleKeyStr = "HOME";
+        private bool MacroRunning 
+        {
+            get 
+            {
+                if (Presets.Count == 0) return false;
+                return Presets[CurrentPresetIndex].IsMacroRunning;
+            }
+            set 
+            {
+                if (Presets.Count > 0)
+                {
+                    Presets[CurrentPresetIndex].IsMacroRunning = value;
+                }
+            }
+        }
+        
+        public List<PresetConfig> Presets = new List<PresetConfig>();
+        public int CurrentPresetIndex = 0;
+        private string _newPresetName = "";
+        private bool _showNewPresetPopup = false;
+        
+        public List<Skill> Skills => Presets.Count > 0 ? Presets[CurrentPresetIndex].Skills : new List<Skill>();
+        public string ToggleKeyStr 
+        {
+            get => Presets.Count > 0 ? Presets[CurrentPresetIndex].ToggleKeyStr : "HOME";
+            set { if (Presets.Count > 0) Presets[CurrentPresetIndex].ToggleKeyStr = value; }
+        }
+        public string SwitchWindowKeyStr 
+        {
+            get => Presets.Count > 0 ? Presets[CurrentPresetIndex].SwitchWindowKeyStr : "";
+            set { if (Presets.Count > 0) Presets[CurrentPresetIndex].SwitchWindowKeyStr = value; }
+        }
 
         private bool _styleInitialized = false;
         private bool _sizeSet = false;
-        private bool _lastHomePressed = false;
         private volatile bool _showMenu = true;
-        private bool _lastInsPressed = false;
         private IntPtr _overlayHandle = IntPtr.Zero;
 
-        private int _bindingIndex = -1; // -1: none, 0: toggle key, 1+: skills
+        private int _bindingIndex = -1; // -1: none, 0: toggle key, -2: switch window key, 1+: skills
         private DateTime _bindStartTime;
 
         private List<string> _availableWindows = new List<string>() { "[NONE - SELECT A GAME WINDOW]" };
-        private int _selectedWindowIndex = 0;
         private DateTime _lastWindowRefresh = DateTime.MinValue;
 
         // Win32 API Imports for global keyboard control
@@ -59,17 +98,33 @@ namespace AutoSkill
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
+        
+        public static string GlobalHideKey = "INSERT";
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
 
         [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool SetForegroundWindow(IntPtr hWnd);
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
 
         [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
+
+        private const uint SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001;
 
         private const int SW_RESTORE = 9;
         private const int SW_HIDE = 0;
@@ -82,15 +137,15 @@ namespace AutoSkill
 
         private void ActivateTargetWindow()
         {
-            if (_selectedWindowIndex > 0 && _selectedWindowIndex < _availableWindows.Count)
+            if (Presets.Count == 0) return;
+            string targetStr = Presets[CurrentPresetIndex].TargetWindowName;
+            
+            if (string.IsNullOrEmpty(targetStr) || targetStr == "[NONE - SELECT A GAME WINDOW]") return;
+
+            IntPtr hWnd = GetTargetWindowHandle();
+            if (hWnd != IntPtr.Zero)
             {
-                string targetTitle = _availableWindows[_selectedWindowIndex];
-                var process = Process.GetProcesses().FirstOrDefault(p => p.MainWindowTitle == targetTitle);
-                if (process != null && process.MainWindowHandle != IntPtr.Zero)
-                {
-                    ShowWindow(process.MainWindowHandle, SW_RESTORE);
-                    SetForegroundWindow(process.MainWindowHandle);
-                }
+                ForceForegroundWindow(hWnd);
             }
         }
 
@@ -106,18 +161,191 @@ namespace AutoSkill
             return string.Empty;
         }
 
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetCursorPos(int X, int Y);
+
+        [DllImport("user32.dll")]
+        private static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorPos(out POINT lpPoint);
+
+        [DllImport("user32.dll")]
+        private static extern bool BringWindowToTop(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        private static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOACTIVATE = 0x0010;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT { public int X, Y; }
+
+        private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+        private const uint MOUSEEVENTF_LEFTUP = 0x0004;
+        private const int SW_MINIMIZE = 6;
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        private const uint WM_SYSCOMMAND = 0x0112;
+        private const int SC_RESTORE = 0xF120;
+
+        private void ForceForegroundWindow(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return;
+            
+            // Proper way to restore a window that hooks OS messages (like games)
+            // This is identical to clicking the icon in the taskbar
+            SendMessage(hWnd, WM_SYSCOMMAND, (IntPtr)SC_RESTORE, IntPtr.Zero);
+            
+            Thread.Sleep(50);
+            BringWindowToTop(hWnd);
+            SetForegroundWindow(hWnd);
+        }
+
+        private bool IsPresetWindowActive(PresetConfig preset)
+        {
+            IntPtr hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero) return false;
+
+            return hwnd == GetTargetWindowHandleForPreset(preset);
+        }
+
         private bool IsTargetWindowActive()
         {
-            if (_selectedWindowIndex > 0 && _selectedWindowIndex < _availableWindows.Count)
+            if (Presets.Count == 0) return false;
+            string targetStr = Presets[CurrentPresetIndex].TargetWindowName;
+            if (string.IsNullOrEmpty(targetStr) || targetStr == "[NONE - SELECT A GAME WINDOW]") return false;
+
+            IntPtr hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero) return false;
+
+            // 1. Try PID match
+            int bracketIndex = targetStr.IndexOf(']');
+            if (bracketIndex > 1 && targetStr.StartsWith("["))
             {
-                string targetTitle = _availableWindows[_selectedWindowIndex];
-                string currentTitle = GetActiveWindowTitle();
-                if (!string.IsNullOrEmpty(currentTitle) && currentTitle == targetTitle)
+                if (int.TryParse(targetStr.Substring(1, bracketIndex - 1), out int targetPid))
                 {
-                    return true;
+                    GetWindowThreadProcessId(hwnd, out uint activePid);
+                    if (activePid == targetPid) return true;
                 }
             }
+
+            // 2. Fallback: match by window title
+            string activeTitle = GetActiveWindowTitle();
+            string savedTitle = ExtractTitleFromTarget(targetStr);
+            if (!string.IsNullOrEmpty(savedTitle) && activeTitle == savedTitle)
+            {
+                GetWindowThreadProcessId(hwnd, out uint newPid);
+                
+                // Ensure this new PID isn't already claimed by another preset!
+                for (int i = 0; i < Presets.Count; i++)
+                {
+                    if (i == CurrentPresetIndex) continue;
+                    string otherTarget = Presets[i].TargetWindowName;
+                    if (!string.IsNullOrEmpty(otherTarget))
+                    {
+                        int bi = otherTarget.IndexOf(']');
+                        if (bi > 1 && otherTarget.StartsWith("["))
+                        {
+                            if (uint.TryParse(otherTarget.Substring(1, bi - 1), out uint otherPid))
+                            {
+                                if (otherPid == newPid) return false; // Another preset owns this window, don't steal it
+                            }
+                        }
+                    }
+                }
+
+                // Auto-update PID
+                Presets[CurrentPresetIndex].TargetWindowName = $"[{newPid}] {savedTitle}";
+                return true;
+            }
             return false;
+        }
+
+        private string ExtractTitleFromTarget(string targetStr)
+        {
+            if (string.IsNullOrEmpty(targetStr)) return "";
+            int bracketEnd = targetStr.IndexOf(']');
+            if (bracketEnd >= 0 && bracketEnd + 2 < targetStr.Length)
+                return targetStr.Substring(bracketEnd + 2); // Skip "] "
+            return targetStr;
+        }
+
+        private IntPtr GetTargetWindowHandle()
+        {
+            if (Presets.Count == 0) return IntPtr.Zero;
+            return GetTargetWindowHandleForPreset(Presets[CurrentPresetIndex]);
+        }
+
+        private IntPtr GetTargetWindowHandleForPreset(PresetConfig preset)
+        {
+            string targetStr = preset.TargetWindowName;
+            if (string.IsNullOrEmpty(targetStr) || targetStr == "[NONE - SELECT A GAME WINDOW]") return IntPtr.Zero;
+
+            int bracketIndex = targetStr.IndexOf(']');
+            if (bracketIndex > 1 && targetStr.StartsWith("["))
+            {
+                if (int.TryParse(targetStr.Substring(1, bracketIndex - 1), out int pid))
+                {
+                    try
+                    {
+                        var p = Process.GetProcessById(pid);
+                        if (p.MainWindowHandle != IntPtr.Zero && !string.IsNullOrEmpty(p.MainWindowTitle))
+                            return p.MainWindowHandle;
+                    }
+                    catch { }
+                }
+            }
+
+            // 2. Fallback: match by window title (handles PID changes after restart)
+            string savedTitle = ExtractTitleFromTarget(targetStr);
+            if (!string.IsNullOrEmpty(savedTitle))
+            {
+                // Collect PIDs already claimed by OTHER presets
+                var claimedPids = new HashSet<int>();
+                for (int i = 0; i < Presets.Count; i++)
+                {
+                    if (i == CurrentPresetIndex) continue;
+                    string otherTarget = Presets[i].TargetWindowName;
+                    if (!string.IsNullOrEmpty(otherTarget))
+                    {
+                        int bi = otherTarget.IndexOf(']');
+                        if (bi > 1 && otherTarget.StartsWith("["))
+                        {
+                            if (int.TryParse(otherTarget.Substring(1, bi - 1), out int otherPid))
+                            {
+                                try { if (Process.GetProcessById(otherPid).MainWindowHandle != IntPtr.Zero) claimedPids.Add(otherPid); } catch { }
+                            }
+                        }
+                    }
+                }
+
+                var match = Process.GetProcesses()
+                    .FirstOrDefault(p => p.MainWindowTitle == savedTitle 
+                        && p.MainWindowHandle != IntPtr.Zero 
+                        && !claimedPids.Contains(p.Id));
+                if (match != null)
+                {
+                    // Auto-update the saved TargetWindowName with new PID
+                    string newTarget = $"[{match.Id}] {match.MainWindowTitle}";
+                    preset.TargetWindowName = newTarget;
+                    SaveSettings();
+                    return match.MainWindowHandle;
+                }
+            }
+            return IntPtr.Zero;
         }
 
         private void RefreshWindowList()
@@ -129,25 +357,13 @@ namespace AutoSkill
 
             var currentList = Process.GetProcesses()
                 .Where(p => !string.IsNullOrEmpty(p.MainWindowTitle))
-                .Select(p => p.MainWindowTitle)
+                .Select(p => $"[{p.Id}] {p.MainWindowTitle}")
                 .Distinct()
                 .OrderBy(t => t)
                 .ToList();
 
             currentList.Insert(0, "[NONE - SELECT A GAME WINDOW]");
-
-            string currentSelected = _selectedWindowIndex >= 0 && _selectedWindowIndex < _availableWindows.Count ? _availableWindows[_selectedWindowIndex] : "";
-            
             _availableWindows = currentList;
-            _selectedWindowIndex = _availableWindows.IndexOf(currentSelected);
-            
-            if (_selectedWindowIndex == -1 && !string.IsNullOrEmpty(currentSelected) && currentSelected != "[NONE - SELECT A GAME WINDOW]")
-            {
-                // Fallback to partial match if game title changed dynamically (e.g. FPS counter)
-                _selectedWindowIndex = _availableWindows.FindIndex(w => w.Contains(currentSelected) || currentSelected.Contains(w));
-            }
-
-            if (_selectedWindowIndex == -1) _selectedWindowIndex = 0;
         }
 
         private void SaveSettings()
@@ -155,9 +371,10 @@ namespace AutoSkill
             try
             {
                 var options = new JsonSerializerOptions { IncludeFields = true, WriteIndented = true };
-                string json = JsonSerializer.Serialize(Skills, options);
-                File.WriteAllText("config.json", json);
-                File.WriteAllText("hotkey.txt", ToggleKeyStr);
+                string json = JsonSerializer.Serialize(Presets, options);
+                File.WriteAllText("presets.json", json);
+                File.WriteAllText("last_preset.txt", CurrentPresetIndex.ToString());
+                File.WriteAllText("hidekey.txt", GlobalHideKey);
             }
             catch (Exception ex)
             {
@@ -165,47 +382,143 @@ namespace AutoSkill
             }
         }
 
+        private List<Skill> CreateDefaultSkills()
+        {
+            var list = new List<Skill>();
+            string[] keys = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10" };
+            foreach (var k in keys) list.Add(new Skill { Key = k });
+            return list;
+        }
+
         private void LoadSettings()
         {
             try
             {
+                if (File.Exists("presets.json"))
+                {
+                    string json = File.ReadAllText("presets.json");
+                    var options = new JsonSerializerOptions { IncludeFields = true };
+                    var loaded = JsonSerializer.Deserialize<List<PresetConfig>>(json, options);
+                    if (loaded != null && loaded.Count > 0)
+                    {
+                        Presets = loaded;
+                        // Ensure all presets have 20 skills
+                        foreach (var p in Presets)
+                        {
+                            while (p.Skills.Count < 20) p.Skills.Add(new Skill());
+                        }
+
+                        if (File.Exists("last_preset.txt"))
+                        {
+                            if (int.TryParse(File.ReadAllText("last_preset.txt"), out int lastIdx))
+                            {
+                                if (lastIdx >= 0 && lastIdx < Presets.Count)
+                                {
+                                    CurrentPresetIndex = lastIdx;
+                                }
+                            }
+                        }
+                        if (File.Exists("hidekey.txt"))
+                        {
+                            GlobalHideKey = File.ReadAllText("hidekey.txt").Trim();
+                        }
+                        return;
+                    }
+                }
+                
+                // Fallback to legacy config
+                var legacyPreset = new PresetConfig { Name = "Default", Skills = CreateDefaultSkills() };
                 if (File.Exists("config.json"))
                 {
                     string json = File.ReadAllText("config.json");
-                    var options = new JsonSerializerOptions { IncludeFields = true };
-                    var loaded = JsonSerializer.Deserialize<List<Skill>>(json, options);
+                    var loaded = JsonSerializer.Deserialize<List<Skill>>(json, new JsonSerializerOptions { IncludeFields = true });
                     if (loaded != null)
                     {
-                        int count = Math.Min(loaded.Count, Skills.Count);
+                        int count = Math.Min(loaded.Count, legacyPreset.Skills.Count);
                         for (int i = 0; i < count; i++)
                         {
-                            Skills[i].Enabled = loaded[i].Enabled;
-                            Skills[i].Key = loaded[i].Key;
-                            Skills[i].Cooldown = loaded[i].Cooldown;
+                            legacyPreset.Skills[i].Enabled = loaded[i].Enabled;
+                            legacyPreset.Skills[i].Key = loaded[i].Key;
+                            legacyPreset.Skills[i].Cooldown = loaded[i].Cooldown;
                         }
                     }
                 }
-                if (File.Exists("hotkey.txt"))
-                {
-                    ToggleKeyStr = File.ReadAllText("hotkey.txt").Trim();
-                }
+                if (File.Exists("hotkey.txt")) legacyPreset.ToggleKeyStr = File.ReadAllText("hotkey.txt").Trim();
+                
+                Presets.Add(legacyPreset);
+                SaveSettings();
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"[AutoSkill] LoadSettings failed: {ex.Message}");
+                if (Presets.Count == 0) Presets.Add(new PresetConfig { Name = "Default", Skills = CreateDefaultSkills() });
             }
         }
 
-        public Renderer()
+        private void AutoRematchWindows()
         {
-            // Initialize 20 hotkeys (1-0 and F1-F10)
-            string[] keys = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10" };
-            foreach (var k in keys)
+            // On startup, try to re-match each preset's target window by title
+            for (int i = 0; i < Presets.Count; i++)
             {
-                Skills.Add(new Skill { Key = k });
+                var preset = Presets[i];
+                if (string.IsNullOrEmpty(preset.TargetWindowName) || preset.TargetWindowName == "[NONE - SELECT A GAME WINDOW]")
+                    continue;
+
+                string savedTitle = ExtractTitleFromTarget(preset.TargetWindowName);
+                if (string.IsNullOrEmpty(savedTitle)) continue;
+
+                // Check if saved PID still valid
+                int bracketIndex = preset.TargetWindowName.IndexOf(']');
+                if (bracketIndex > 1 && preset.TargetWindowName.StartsWith("["))
+                {
+                    if (int.TryParse(preset.TargetWindowName.Substring(1, bracketIndex - 1), out int pid))
+                    {
+                        try
+                        {
+                            var p = Process.GetProcessById(pid);
+                            if (p.MainWindowHandle != IntPtr.Zero && p.MainWindowTitle == savedTitle)
+                                continue; // PID still valid, no need to rematch
+                        }
+                        catch { }
+                    }
+                }
+
+                // PID invalid, find by title (excluding PIDs claimed by other presets)
+                var claimedPids = new HashSet<int>();
+                for (int j = 0; j < Presets.Count; j++)
+                {
+                    if (j == i) continue;
+                    string otherTarget = Presets[j].TargetWindowName;
+                    if (!string.IsNullOrEmpty(otherTarget))
+                    {
+                        int bi = otherTarget.IndexOf(']');
+                        if (bi > 1 && otherTarget.StartsWith("["))
+                        {
+                            if (int.TryParse(otherTarget.Substring(1, bi - 1), out int otherPid))
+                                claimedPids.Add(otherPid);
+                        }
+                    }
+                }
+
+                var match = Process.GetProcesses()
+                    .FirstOrDefault(p => p.MainWindowTitle == savedTitle
+                        && p.MainWindowHandle != IntPtr.Zero
+                        && !claimedPids.Contains(p.Id));
+                if (match != null)
+                {
+                    preset.TargetWindowName = $"[{match.Id}] {match.MainWindowTitle}";
+                }
             }
+            SaveSettings();
+        }
+
+        public Renderer() : base("Auto Skill")
+        {
+            // Disable Windows foreground lock so we can switch windows freely
+            SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, IntPtr.Zero, 0);
 
             LoadSettings();
+            AutoRematchWindows(); // Auto-find game windows by title on startup
 
             // Separate thread for hotkeys to prevent polling delay
             Thread hotkeyThread = new Thread(HotkeyLoop);
@@ -388,6 +701,7 @@ namespace AutoSkill
                     if (i == 0x1B) // ESC cancels binding
                     {
                         _bindingIndex = -1;
+                        SaveSettings();
                         break;
                     }
 
@@ -397,6 +711,11 @@ namespace AutoSkill
                     if (_bindingIndex == 0)
                     {
                         ToggleKeyStr = keyName;
+                        _lastHomePressed[keyName] = true;
+                    }
+                    else if (_bindingIndex == -2)
+                    {
+                        GlobalHideKey = keyName;
                     }
                     else
                     {
@@ -410,6 +729,8 @@ namespace AutoSkill
             }
         }
 
+        private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+
         private static void PressKey(byte vkey)
         {
             uint scanCode = MapVirtualKey(vkey, 0);
@@ -417,31 +738,135 @@ namespace AutoSkill
             // Press key down using Hardware Scan Code
             keybd_event(0, (byte)scanCode, KEYEVENTF_SCANCODE, UIntPtr.Zero);
             
-            // Synchronous delay (prevents OS input buffer overflow which causes stuck keys!)
-            Thread.Sleep(15); 
+            // Synchronous delay (longer hold for game engine compatibility)
+            Thread.Sleep(50); 
             
             // Release key
             keybd_event(0, (byte)scanCode, KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE, UIntPtr.Zero);
+        }
+
+        private Dictionary<string, bool> _lastHomePressed = new Dictionary<string, bool>();
+        private bool _lastInsPressed = false;
+        private Dictionary<string, bool> _lastSwitchPressed = new Dictionary<string, bool>();
+        private DateTime _lastSwitchTime = DateTime.MinValue;
+
+        private void AutoSwitchPresetOnFocus()
+        {
+            if (Presets.Count <= 1) return; // Don't auto-switch if only 1 preset
+            
+            // Pause auto-switching for 1 second after a manual hotkey switch.
+            // This prevents the auto-switch from instantly reverting the preset because the OS hasn't brought the new window to foreground yet.
+            if ((DateTime.Now - _lastSwitchTime).TotalMilliseconds < 1000) return;
+
+            IntPtr hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero || hwnd == _overlayHandle) return;
+
+            GetWindowThreadProcessId(hwnd, out uint activePid);
+            
+            // If current preset already matches the active window, do nothing (prevents flickering)
+            string currentTarget = Presets[CurrentPresetIndex].TargetWindowName;
+            if (!string.IsNullOrEmpty(currentTarget) && currentTarget.StartsWith("["))
+            {
+                int bIdx = currentTarget.IndexOf(']');
+                if (bIdx > 1 && int.TryParse(currentTarget.Substring(1, bIdx - 1), out int currentPid))
+                {
+                    if (currentPid == activePid) return;
+                }
+            }
+            
+            for (int i = 0; i < Presets.Count; i++)
+            {
+                if (i == CurrentPresetIndex) continue;
+                
+                string targetStr = Presets[i].TargetWindowName;
+                if (string.IsNullOrEmpty(targetStr) || targetStr == "[NONE - SELECT A GAME WINDOW]") continue;
+
+                int bracketIndex = targetStr.IndexOf(']');
+                if (bracketIndex > 1 && targetStr.StartsWith("["))
+                {
+                    if (int.TryParse(targetStr.Substring(1, bracketIndex - 1), out int targetPid))
+                    {
+                        if (activePid == targetPid)
+                        {
+                            CurrentPresetIndex = i; // Auto-switch UI to this preset
+                            return;
+                        }
+                    }
+                }
+            }
         }
 
         private void HotkeyLoop()
         {
             while (true)
             {
-                byte toggleVk = GetVirtualKeyCode(ToggleKeyStr);
-                if (toggleVk == 0) toggleVk = 0x24; // Fallback to HOME
+                AutoSwitchPresetOnFocus();
+                
+                HashSet<string> processedKeys = new HashSet<string>();
 
-                short homeState = GetAsyncKeyState(toggleVk);
-                bool homePressed = (homeState & 0x8000) != 0;
-
-                if (homePressed && !_lastHomePressed)
+                // Check Global Hotkeys for ALL presets using ToggleKeyStr
+                for (int i = 0; i < Presets.Count; i++)
                 {
-                    MacroRunning = !MacroRunning;
-                    if (MacroRunning) ActivateTargetWindow();
-                }
-                _lastHomePressed = homePressed;
+                    var preset = Presets[i];
+                    string hotkeyToUse = preset.ToggleKeyStr; // Use ToggleKeyStr as the unified hotkey
+                    if (string.IsNullOrEmpty(hotkeyToUse)) hotkeyToUse = "HOME"; // Fallback
 
-                short insState = GetAsyncKeyState(0x2D);
+                    if (processedKeys.Contains(hotkeyToUse)) continue;
+
+                    byte switchVk = GetVirtualKeyCode(hotkeyToUse);
+                    if (switchVk != 0)
+                    {
+                        short switchState = GetAsyncKeyState(switchVk);
+                        bool switchPressed = (switchState & 0x8000) != 0;
+                        
+                        _lastHomePressed.TryGetValue(hotkeyToUse, out bool lastPressed);
+                        
+                        if (switchPressed && !lastPressed)
+                        {
+                            // Determine if ANY preset using this hotkey is currently running
+                            bool anyRunning = false;
+                            for (int j = 0; j < Presets.Count; j++)
+                            {
+                                string h = Presets[j].ToggleKeyStr;
+                                if (string.IsNullOrEmpty(h)) h = "HOME";
+                                if (h == hotkeyToUse && Presets[j].IsMacroRunning)
+                                {
+                                    anyRunning = true;
+                                    break;
+                                }
+                            }
+                            
+                            // Toggle the state for ALL presets sharing this hotkey
+                            bool newState = !anyRunning;
+                            for (int j = 0; j < Presets.Count; j++)
+                            {
+                                string h = Presets[j].ToggleKeyStr;
+                                if (string.IsNullOrEmpty(h)) h = "HOME";
+                                if (h == hotkeyToUse)
+                                {
+                                    Presets[j].IsMacroRunning = newState;
+                                    
+                                    // If we just turned it ON, bring the window to the front so it can start attacking!
+                                    if (newState)
+                                    {
+                                        IntPtr hWnd = GetTargetWindowHandleForPreset(Presets[j]);
+                                        if (hWnd != IntPtr.Zero) ForceForegroundWindow(hWnd);
+                                    }
+                                }
+                            }
+                            
+                            CurrentPresetIndex = i;
+                            _lastSwitchTime = DateTime.Now;
+                        }
+                        
+                        _lastHomePressed[hotkeyToUse] = switchPressed;
+                        processedKeys.Add(hotkeyToUse);
+                    }
+                }
+
+
+                byte hideVk = GetVirtualKeyCode(GlobalHideKey);
+                short insState = hideVk != 0 ? GetAsyncKeyState(hideVk) : (short)0;
                 bool insPressed = (insState & 0x8000) != 0;
 
                 if (insPressed && !_lastInsPressed)
@@ -462,12 +887,19 @@ namespace AutoSkill
         {
             while (true)
             {
-                if (MacroRunning && IsTargetWindowActive())
+                // Check ALL presets - send keys for whichever preset's window is currently active
+                for (int i = 0; i < Presets.Count; i++)
                 {
+                    var preset = Presets[i];
+                    if (!preset.IsMacroRunning) continue;
+
+                    // Check if THIS preset's target window is the foreground window
+                    if (!IsPresetWindowActive(preset)) continue;
+
                     var now = DateTime.Now;
-                    foreach (var skill in Skills)
+                    foreach (var skill in preset.Skills)
                     {
-                        if (!MacroRunning) break; // Exit immediately if toggled off
+                        if (!preset.IsMacroRunning) break;
                         if (skill.Enabled)
                         {
                             double elapsed = (now - skill.LastUsed).TotalSeconds;
@@ -477,21 +909,70 @@ namespace AutoSkill
                                 if (vk != 0)
                                 {
                                     PressKey(vk);
-                                    skill.LastUsed = now; // ULTRA FAST
+                                    skill.LastUsed = now;
                                 }
                             }
                         }
                     }
+                    break; // Only one window can be foreground at a time
                 }
-                Thread.Sleep(1); // 1ms sleep for ultra-fast polling
+                Thread.Sleep(1);
             }
         }
+
+        private bool _isCurrentlyTopMost = true;
+
+        private bool _firstFrame = true;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern IntPtr LoadImage(IntPtr hinst, string lpszName, uint uType, int cxDesired, int cyDesired, uint fuLoad);
+
+        private const uint IMAGE_ICON = 1;
+        private const uint LR_LOADFROMFILE = 0x00000010;
+        private const uint LR_DEFAULTSIZE = 0x00000040;
+
+        private const uint WM_SETICON = 0x0080;
+        private const uint SWP_NOZORDER = 0x0004;
 
         protected override void Render()
         {
             if (_overlayHandle == IntPtr.Zero)
             {
                 _overlayHandle = Process.GetCurrentProcess().MainWindowHandle;
+            }
+
+            if (_firstFrame && _overlayHandle != IntPtr.Zero)
+            {
+                _firstFrame = false;
+                
+                // Set window icon
+                string iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "icon.ico");
+                if (File.Exists(iconPath))
+                {
+                    IntPtr hIcon = LoadImage(IntPtr.Zero, iconPath, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+                    if (hIcon != IntPtr.Zero)
+                    {
+                        SendMessage(_overlayHandle, WM_SETICON, (IntPtr)0, hIcon); // ICON_SMALL
+                        SendMessage(_overlayHandle, WM_SETICON, (IntPtr)1, hIcon); // ICON_BIG
+                    }
+                }
+            }
+
+            if (!_showMenu) return;
+
+            if (_overlayHandle != IntPtr.Zero)
+            {
+                IntPtr fgHwnd = GetForegroundWindow();
+                bool shouldBeTopmost = (fgHwnd == _overlayHandle);
+                
+                if (shouldBeTopmost != _isCurrentlyTopMost)
+                {
+                    _isCurrentlyTopMost = shouldBeTopmost;
+                    SetWindowPos(_overlayHandle, shouldBeTopmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
             }
 
             if (!_sizeSet)
@@ -507,8 +988,10 @@ namespace AutoSkill
 
             HandleKeyBinding();
 
-            // Center window on first launch. It will remember its position automatically afterwards.
             var io = ImGui.GetIO();
+            io.ConfigFlags &= ~ImGuiConfigFlags.NavEnableKeyboard;
+            io.ConfigFlags &= ~ImGuiConfigFlags.NavEnableGamepad;
+            
             ImGui.SetNextWindowPos(new Vector2(io.DisplaySize.X * 0.5f, io.DisplaySize.Y * 0.5f), ImGuiCond.FirstUseEver, new Vector2(0.5f, 0.5f));
 
             bool isOpen = true;
@@ -518,30 +1001,164 @@ namespace AutoSkill
                 Close();
             }
 
-            if (ImGui.CollapsingHeader("Menu", ImGuiTreeNodeFlags.DefaultOpen))
+            if (ImGui.CollapsingHeader("Preset Profiles", ImGuiTreeNodeFlags.DefaultOpen))
             {
-                bool macroState = MacroRunning;
-                if (ImGui.Checkbox($"Enable Macro [{ToggleKeyStr}]", ref macroState))
+                if (ImGui.BeginTable("ProfileTable", 2, ImGuiTableFlags.None))
                 {
-                    MacroRunning = macroState;
-                    if (MacroRunning) ActivateTargetWindow();
+                    ImGui.TableSetupColumn("Labels", ImGuiTableColumnFlags.WidthFixed, 110f);
+                    ImGui.TableSetupColumn("Controls", ImGuiTableColumnFlags.WidthStretch);
+                    
+                    ImGui.TableNextRow();
+                    ImGui.TableNextColumn();
+                    ImGui.AlignTextToFramePadding();
+                    ImGui.Text("Profile:");
+                    
+                    ImGui.TableNextColumn();
+                    float newBtnWidth = 45f;
+                    float delBtnWidth = 60f;
+                    float spacing = ImGui.GetStyle().ItemSpacing.X;
+                    float comboWidth = ImGui.GetContentRegionAvail().X - newBtnWidth - delBtnWidth - (spacing * 2);
+
+                    ImGui.SetNextItemWidth(comboWidth);
+                    string[] presetNames = Presets.Select(p => p.Name).ToArray();
+                    if (ImGui.Combo("##Preset", ref CurrentPresetIndex, presetNames, presetNames.Length))
+                    {
+                        MacroRunning = false;
+                    }
+
+                    ImGui.SameLine();
+                    if (ImGui.Button("New", new Vector2(newBtnWidth, 0))) _showNewPresetPopup = true;
+                    
+                    ImGui.SameLine();
+                    if (ImGui.Button("Delete", new Vector2(delBtnWidth, 0)) && Presets.Count > 1)
+                    {
+                        Presets.RemoveAt(CurrentPresetIndex);
+                        if (CurrentPresetIndex >= Presets.Count) CurrentPresetIndex = Presets.Count - 1;
+                        SaveSettings();
+                        MacroRunning = false;
+                    }
+                    
+                    ImGui.EndTable();
                 }
-                ImGui.SameLine();
-                string toggleBtn = (_bindingIndex == 0) ? "Press any key..." : $"Change Key: {ToggleKeyStr}";
-                if (ImGui.Button(toggleBtn, new Vector2(150, 0)))
+
+                if (_showNewPresetPopup)
                 {
-                    if (_bindingIndex == -1) {
-                        _bindingIndex = 0;
-                        _bindStartTime = DateTime.Now;
+                    ImGui.InputText("##NewPresetName", ref _newPresetName, 32);
+                    ImGui.SameLine();
+                    if (ImGui.Button("Add"))
+                    {
+                        if (!string.IsNullOrWhiteSpace(_newPresetName))
+                        {
+                            var newPreset = new PresetConfig 
+                            { 
+                                Name = _newPresetName, 
+                                Skills = CreateDefaultSkills(),
+                                ToggleKeyStr = "HOME"
+                            };
+                            Presets.Add(newPreset);
+                            CurrentPresetIndex = Presets.Count - 1;
+                            _newPresetName = "";
+                            _showNewPresetPopup = false;
+                            SaveSettings();
+                        }
+                    }
+                    ImGui.SameLine();
+                    if (ImGui.Button("Cancel"))
+                    {
+                        _newPresetName = "";
+                        _showNewPresetPopup = false;
                     }
                 }
+            }
 
-                ImGui.Text("Target Game Window:");
-                RefreshWindowList();
-                ImGui.SetNextItemWidth(300);
-                string[] windowsArray = _availableWindows.ToArray();
-                ImGui.Combo("##GameWindow", ref _selectedWindowIndex, windowsArray, windowsArray.Length);
+            if (_showNewPresetPopup) ImGui.BeginDisabled();
 
+            if (ImGui.CollapsingHeader("Menu", ImGuiTreeNodeFlags.DefaultOpen))
+            {
+                if (ImGui.BeginTable("MenuTable", 2, ImGuiTableFlags.None))
+                {
+                    ImGui.TableSetupColumn("Labels", ImGuiTableColumnFlags.WidthFixed, 110f);
+                    ImGui.TableSetupColumn("Controls", ImGuiTableColumnFlags.WidthStretch);
+                    
+                    ImGui.TableNextRow();
+                    ImGui.TableNextColumn();
+                    bool macroState = MacroRunning;
+                    if (ImGui.Checkbox("Enable Macro", ref macroState))
+                    {
+                        MacroRunning = macroState;
+                        if (MacroRunning) ActivateTargetWindow();
+                    }
+                    
+                    ImGui.TableNextColumn();
+                    string toggleBtn = (_bindingIndex == 0) ? "Press any key..." : ToggleKeyStr;
+                    if (ImGui.Button(toggleBtn, new Vector2(-1, 0)))
+                    {
+                        if (_bindingIndex == -1) {
+                            _bindingIndex = 0;
+                            _bindStartTime = DateTime.Now;
+                        }
+                    }
+                    
+                    ImGui.TableNextRow();
+                    ImGui.TableNextColumn();
+                    ImGui.AlignTextToFramePadding();
+                    ImGui.Text("Hide Menu");
+                    
+                    ImGui.TableNextColumn();
+                    string hideBtn = (_bindingIndex == -2) ? "Press any key..." : GlobalHideKey;
+                    if (ImGui.Button(hideBtn, new Vector2(-1, 0)))
+                    {
+                        if (_bindingIndex == -1) {
+                            _bindingIndex = -2;
+                            _bindStartTime = DateTime.Now;
+                        }
+                    }
+                    
+                    ImGui.TableNextRow();
+                    ImGui.TableNextColumn();
+                    ImGui.AlignTextToFramePadding();
+                    ImGui.Text("Game Window");
+                    
+                    ImGui.TableNextColumn();
+                    RefreshWindowList();
+                    ImGui.SetNextItemWidth(-1);
+                    string[] windowsArray = _availableWindows.ToArray();
+                    
+                    string currentTarget = Presets.Count > 0 ? Presets[CurrentPresetIndex].TargetWindowName : "";
+                    int idx = _availableWindows.IndexOf(currentTarget);
+                    
+                    // If exact match fails (e.g. PID changed), try matching by title
+                    if (idx == -1 && !string.IsNullOrEmpty(currentTarget) && currentTarget != "[NONE - SELECT A GAME WINDOW]")
+                    {
+                        string savedTitle = ExtractTitleFromTarget(currentTarget);
+                        for (int i = 0; i < _availableWindows.Count; i++)
+                        {
+                            if (ExtractTitleFromTarget(_availableWindows[i]) == savedTitle)
+                            {
+                                idx = i;
+                                // Auto-update to new PID string
+                                Presets[CurrentPresetIndex].TargetWindowName = _availableWindows[i];
+                                SaveSettings();
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (idx == -1 && _availableWindows.Count > 0) idx = 0; // Fallback
+
+                    if (ImGui.Combo("##GameWindow", ref idx, windowsArray, windowsArray.Length))
+                    {
+                        if (Presets.Count > 0 && idx >= 0 && idx < _availableWindows.Count)
+                        {
+                            Presets[CurrentPresetIndex].TargetWindowName = _availableWindows[idx];
+                            SaveSettings();
+                        }
+                    }
+                    
+                    ImGui.EndTable();
+                }
+
+                ImGui.Dummy(new Vector2(0, 5));
                 bool targetActive = IsTargetWindowActive();
                 if (MacroRunning)
                 {
@@ -565,10 +1182,12 @@ namespace AutoSkill
             }
 
             ImGui.Dummy(new Vector2(0, 5));
-            string creditText = "Version 1.0";
+            string creditText = "Version 1.1";
             float textWidth = ImGui.CalcTextSize(creditText).X;
             ImGui.SetCursorPosX(ImGui.GetWindowWidth() - textWidth - 10);
             ImGui.TextDisabled(creditText);
+
+            if (_showNewPresetPopup) ImGui.EndDisabled();
 
             ImGui.End();
         }
@@ -576,11 +1195,11 @@ namespace AutoSkill
         private void RenderSkillsTable(string id, int startIdx, int endIdx)
         {
             ImGui.Dummy(new Vector2(0, 5));
-            if (ImGui.BeginTable(id, 3, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingFixedFit | ImGuiTableFlags.NoSavedSettings))
+            if (ImGui.BeginTable(id, 3, ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.BordersOuter | ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingFixedFit | ImGuiTableFlags.NoSavedSettings))
             {
-                ImGui.TableSetupColumn("Active", ImGuiTableColumnFlags.WidthFixed, 55f);
-                ImGui.TableSetupColumn("Hotkey", ImGuiTableColumnFlags.WidthFixed, 85f);
-                ImGui.TableSetupColumn("Cooldown", ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableSetupColumn("Active", ImGuiTableColumnFlags.WidthFixed, 45f);
+                ImGui.TableSetupColumn("Hotkey", ImGuiTableColumnFlags.WidthFixed, 70f);
+                ImGui.TableSetupColumn("Cooldown", ImGuiTableColumnFlags.WidthFixed, 210f);
                 ImGui.TableHeadersRow();
 
                 for (int i = startIdx; i < endIdx; i++)
@@ -589,7 +1208,7 @@ namespace AutoSkill
                     ImGui.TableNextRow();
 
                     ImGui.TableSetColumnIndex(0);
-                    ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (55f - 24f) / 2f); // Perfect centering
+                    ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (45f - 24f) / 2f); // Perfect centering
                     bool changed = false;
 
                     if (ImGui.Checkbox($"##chk{i}", ref skill.Enabled)) changed = true;
@@ -609,7 +1228,7 @@ namespace AutoSkill
 
                     ImGui.TableSetColumnIndex(2);
                     ImGui.SetNextItemWidth(-1);
-                    ImGui.DragFloat($"##cd{i}", ref skill.Cooldown, 0.01f, 0.00f, 10.0f, "%.2fs");
+                    ImGui.DragFloat($"##cd{i}", ref skill.Cooldown, 0.0f, 0.00f, 10.0f, "%.2fs");
                     if (ImGui.IsItemDeactivatedAfterEdit()) changed = true;
                     
                     if (skill.Cooldown < 0.00f) skill.Cooldown = 0.00f;

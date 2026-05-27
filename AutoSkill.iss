@@ -1,6 +1,6 @@
 [Setup]
 AppName=AutoSkill
-AppVersion=1.0
+AppVersion=1.1
 AppPublisher=Cowforgetfeet
 DefaultDirName={autopf}\AutoSkill
 DefaultGroupName=AutoSkill
@@ -8,7 +8,7 @@ UninstallDisplayIcon={app}\AutoSkill.exe
 Compression=lzma2
 SolidCompression=yes
 OutputDir=C:\Users\Account\Desktop\Rebirth\AutoSkill
-OutputBaseFilename=AutoSkill_Setup_v1.0
+OutputBaseFilename=AutoSkill_Setup_v1.1
 
 [Files]
 Source: "C:\Users\Account\Desktop\Rebirth\AutoSkill\publish\AutoSkill.exe"; DestDir: "{app}"; Flags: ignoreversion
